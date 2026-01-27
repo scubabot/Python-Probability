@@ -1,18 +1,19 @@
-# Probabilistic Resilience Replication
+# ML-Resilient Gaussian Process Modeling
 
-This project is a Python-based replication of 3D resilience visualizations for the SCUBA Lab. It transitions original MATLAB-based Gaussian Process (GP) models into a modern Python environment.
+This repository implements a machine learning framework for resilient Gaussian Process (GP) modeling under adversarial conditions in a multi-agent setting.
 
-## Project Overview
-The repository contains scripts to parse `.mat` workspace files and render the following surfaces:
-- **Actual GP:** The target environment model.
-- **Initial GP:** Sparse initial observations (43 data points).
-- **Non-Resilient MIPP:** Simulated system failure state.
-- **Resilient MIPP:** Optimized resilient state.
+The project combines probabilistic modeling, active learning, and robust aggregation to maintain accurate environmental estimation even when some agents behave maliciously or provide corrupted observations.
 
-## Installation & Setup
-1. **Dependencies:**
-   Ensure you have the following libraries installed:
-   ```bash
-   pip install numpy scipy matplotlib
-   ## Replicated Results
-![Resilience Surfaces](results.png)
+## Key Features
+
+- Gaussian Process regression for spatial field estimation  
+- Uncertainty-driven active sampling (active learning)  
+- Simulation of adversarial agents injecting corrupted observations  
+- Robust aggregation using W-MSR–style resilient consensus  
+- Comparative evaluation of resilient vs non-resilient learning  
+- Visualization of estimation error and uncertainty evolution  
+
+## Example Usage
+
+```bash
+python multi_agent_resilience.py
