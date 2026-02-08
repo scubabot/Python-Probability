@@ -85,10 +85,8 @@ def aggregate(hypers_list, mode="mean", F=1):
 
     raise ValueError("mode must be 'mean' or 'wmsr'")
 
-
-# -----------------------------
 # Fault model (spatially inconsistent attack)
-# -----------------------------
+
 def spatial_attack(x_new, bias):
     """
     Location-dependent corruption so faulty agents learn different hypers.
@@ -96,9 +94,6 @@ def spatial_attack(x_new, bias):
     """
     x1 = float(x_new[0, 0])
     x2 = float(x_new[0, 1])
-
-    # Keep it smooth but clearly non-constant. Works for most normalized grid coordinates.
-    # If your grid is not in [0,1], this still varies spatially.
     return float(bias * np.sin(2 * np.pi * x1) * np.cos(2 * np.pi * x2))
 
 
@@ -255,10 +250,6 @@ def run_multi_agent(
     # default: average agent means (kept for consistency with your old code)
     return np.mean(preds, axis=0)
 
-
-# -----------------------------
-# Plotting
-# -----------------------------
 def plot_3d_panel(ax, Z, title, elev=25, azim=-135):
     n = Z.shape[0]
     X, Y = np.meshgrid(np.arange(n), np.arange(n))
@@ -299,21 +290,24 @@ def main():
     y_init = gp_init.predict(grid)
     Z_init = y_init.reshape(GRID_RES, GRID_RES)
 
-    # -----------------------------
-    # Settings (these will show a difference)
-    # -----------------------------
+# -----------------------------
+# Settings
+# -----------------------------
     N = 7
+
     T = 50
     meeting_every = 10
 
-    n_faulty = 2
-    F = 2  # for N=7, trimming 2 low + 2 high leaves 3 values
+    n_faulty = 3
+    F = 3
 
     faulty_bias = 7.0
     faulty_noise_std = 3.0
     clean_noise_std = 0.0
 
     seed = 0
+
+
 
     # Pick faulty set ONCE so mean vs wmsr is apples-to-apples
     rng = np.random.default_rng(seed)
@@ -322,10 +316,8 @@ def main():
     faulty_set = set(idxs[:n_faulty])
     print(f"[main] fixed faulty_set={sorted(list(faulty_set))} (N={N}, n_faulty={n_faulty}, F={F})")
 
-    # If you want even clearer separation, set freeze_after_meeting=False
     freeze_after_meeting = True
 
-    # This makes the resilient output extremely clear (recommended)
     fuse_predictions = True
 
     # (c) Non-resilient
@@ -374,12 +366,10 @@ def main():
     )
     Z_res = y_res.reshape(GRID_RES, GRID_RES)
 
-    # Print numeric proof
+    # Print in number
     print(f"[metric] RMSE init    : {rmse(y_init, y_actual):.4f}")
     print(f"[metric] RMSE nonres  : {rmse(y_nonres, y_actual):.4f}")
     print(f"[metric] RMSE resilient: {rmse(y_res, y_actual):.4f}")
-
-    # 3D 2x2 plot
     fig = plt.figure(figsize=(14, 9))
 
     ax1 = fig.add_subplot(2, 2, 1, projection="3d")
