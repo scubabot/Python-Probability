@@ -293,16 +293,16 @@ def main():
 # -----------------------------
 # Settings
 # -----------------------------
-    N = 7
+    N = 50
 
     T = 50
     meeting_every = 10
 
-    n_faulty = 3
-    F = 3
+    n_faulty = 23
+    F = 23
 
     faulty_bias = 7.0
-    faulty_noise_std = 3.0
+    faulty_noise_std = 5.0
     clean_noise_std = 0.0
 
     seed = 0
