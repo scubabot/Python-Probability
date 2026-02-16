@@ -113,6 +113,7 @@ def run_multi_agent(
     F=1,
     n_faulty=1,
     faulty_set=None,
+
     # corruption controls
     faulty_bias=7.0,
     faulty_noise_std=3.0,
@@ -169,6 +170,8 @@ def run_multi_agent(
                 "used": used,
                 "gp": gp,
                 "rng": np.random.default_rng(seed + 1000 + i),
+                "path": [X0[0].copy()],   # stores the visited (x,y) points
+
             }
         )
 
@@ -187,6 +190,8 @@ def run_multi_agent(
             idx_next = int(np.argmax(y_std_masked + jitter))
 
             x_new = grid[idx_next].reshape(1, 2)
+            a["path"].append(x_new.reshape(2,))
+
             y_true = float(y_actual[idx_next])
 
             if a["faulty"]:
@@ -237,18 +242,19 @@ def run_multi_agent(
         preds.append(a["gp"].predict(grid))
     preds = np.vstack(preds)  # shape (N, M)
 
+       # build path dictionary (NEW)
+    paths = {a["id"]: np.array(a["path"]) for a in agents}
+
     if fuse_predictions:
-        # robust pointwise fusion (very visible difference)
         y_fused = np.zeros(preds.shape[1])
         for j in range(preds.shape[1]):
             if mode == "wmsr":
                 y_fused[j] = wmsr(preds[:, j], F)
             else:
                 y_fused[j] = float(np.mean(preds[:, j]))
-        return y_fused
+        return y_fused, paths   
 
-    # default: average agent means (kept for consistency with your old code)
-    return np.mean(preds, axis=0)
+    return np.mean(preds, axis=0), paths   
 
 def plot_3d_panel(ax, Z, title, elev=25, azim=-135):
     n = Z.shape[0]
@@ -293,13 +299,13 @@ def main():
 # -----------------------------
 # Settings
 # -----------------------------
-    N = 50
+    N = 5
 
     T = 50
     meeting_every = 10
 
-    n_faulty = 23
-    F = 23
+    n_faulty = 2
+    F = 2
 
     faulty_bias = 7.0
     faulty_noise_std = 5.0
