@@ -477,12 +477,12 @@ def main():
     # -----------------------------
     # SETTINGS
     # -----------------------------
-    N = 5
+    N = 3
     T = 50
     meeting_every = 10
 
-    n_faulty = 2
-    F = 2
+    n_faulty = 1
+    F = 1
 
     faulty_bias = 7.0
     faulty_noise_std = 5.0
