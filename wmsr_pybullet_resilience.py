@@ -1,5 +1,5 @@
 # scripts/four_drones_wmsr.py
-# FULL WORKING CODE
+# FULL WORKING CODE (UPDATED PLOTTING)
 # - 4 drones in Gym-PyBullet (CtrlAviary) using built-in PID (DSLPIDControl)
 # - PID outputs motor RPMs -> env.step(rpms)
 # - Adds a simple "meeting + WMSR fusion" pipeline (share GP hyperparameters only)
@@ -7,7 +7,10 @@
 #     - wmsr_distance.png  (distance-to-goal vs time)
 #     - wmsr_x.png         (x(t) vs time)
 #     - wmsr_xy.png        (XY trajectories with A/B markers)
-#     - planning_paths_4panel.png  (robot1/2/3 paths + replanning after meeting)
+#     - path_robot1.png    (separate paper-style path for robot 1)
+#     - path_robot2.png    (separate paper-style path for robot 2)
+#     - path_robot3.png    (separate paper-style path for robot 3)
+#     - replanning_after_meeting.png (post-meeting segments for all robots)
 #
 # Run:
 #   (.venv) python scripts/four_drones_wmsr.py
@@ -32,7 +35,6 @@ from sklearn.gaussian_process.kernels import Matern, ConstantKernel as C, WhiteK
 # yi = f(x,y) + noise (+ attack for faulty)
 # -----------------------------
 def field_f(x: float, y: float) -> float:
-    # Smooth, nontrivial field (like temperature/gas concentration)
     return (
         1.2 * np.sin(0.8 * x)
         + 0.9 * np.cos(0.6 * y)
@@ -41,8 +43,7 @@ def field_f(x: float, y: float) -> float:
 
 
 # -----------------------------
-# GP helpers (same idea as your python mapping code)
-# Each drone fits GP locally and extracts hypers (amp, ls, noi)
+# GP helpers
 # -----------------------------
 def build_gp(amp=1.0, ls=1.0, noi=0.2, *, optimize=True, seed=0):
     kernel = (
@@ -89,7 +90,7 @@ def aggregate_hypers(hypers_list, mode="wmsr", F=1):
 
 
 # -----------------------------
-# Plot helpers (paper-ish paths)
+# Plot helpers
 # -----------------------------
 def field_grid(xmin=0.0, xmax=2.0, ymin=0.0, ymax=1.2, n=60):
     xs = np.linspace(xmin, xmax, n)
@@ -145,8 +146,8 @@ def main():
     PHY = Physics.PYB
 
     # Reach/settle detection
-    TOL = 0.12          # meters
-    SETTLE_SEC = 1.0    # seconds within tolerance before "arrived"
+    TOL = 0.12
+    SETTLE_SEC = 1.0
 
     # ---------- A (starts) and B (goals) ----------
     A = np.array(
@@ -169,28 +170,25 @@ def main():
         dtype=np.float32,
     )
 
-    TARGET_RPY = np.zeros((NUM, 3), dtype=np.float32)  # [roll,pitch,yaw] targets
+    TARGET_RPY = np.zeros((NUM, 3), dtype=np.float32)
     TARGET_RPY[:, 2] = 0.0
 
     # ---------- MEETING SETTINGS ----------
-    # We force a rendezvous at this XY and do WMSR fusion there.
     MEETING_POINT = np.array([0.75, 0.60, 1.20], dtype=np.float32)
     MEETING_EVERY_SEC = 6.0
     MEETING_EVERY_STEPS = int(MEETING_EVERY_SEC * CTRL_FREQ)
-    MEETING_RADIUS = 0.15  # meters
+    MEETING_RADIUS = 0.15
 
     # ---------- WMSR / FAULT MODEL ----------
-    # With N=4, a reasonable trim is F=1 (drop smallest + largest, average middle 2)
     MODE = "wmsr"
     F = 1
 
-    # Choose one faulty agent (biasing its measurement)
-    faulty_set = {2}          # change if you want
-    attack_bias = 2.5         # adds spatial bias
-    meas_noise_std = 0.05     # all drones noise
-    faulty_extra_noise = 0.15 # extra noisy for faulty
+    faulty_set = {2}
+    attack_bias = 2.5
+    meas_noise_std = 0.05
+    faulty_extra_noise = 0.15
 
-    print("4-Drone PID A -> B demo + meeting/WMSR fusion (PID outputs RPMs, env takes RPMs).")
+    print("4-Drone PID A -> B demo + meeting/WMSR fusion.")
     print("A:\n", A)
     print("B:\n", B)
     print(f"tol={TOL}m duration={DURATION_SEC}s freq={CTRL_FREQ}Hz")
@@ -207,7 +205,7 @@ def main():
         physics=PHY,
         gui=GUI,
         record=False,
-        ctrl_freq=CTRL_FREQ,  # <-- correct for CtrlAviary
+        ctrl_freq=CTRL_FREQ,
     )
     obs, info = env.reset()
 
@@ -215,51 +213,53 @@ def main():
     ctrls = [DSLPIDControl(drone_model=DRONE_MODEL) for _ in range(NUM)]
 
     # ---------- LOCAL GP STATE PER DRONE ----------
-    # Each drone stores (xi, yi) in 2D (x,y) and fits GP
     drones = []
     for i in range(NUM):
         gp = build_gp(optimize=True, seed=10 + i)
         X = np.empty((0, 2), dtype=float)
         y = np.empty((0,), dtype=float)
-        drones.append(
-            {
-                "id": i,
-                "gp": gp,
-                "X": X,
-                "y": y,
-            }
-        )
+        drones.append({"id": i, "gp": gp, "X": X, "y": y})
 
     # ---------- LOGS ----------
     times = np.zeros(STEPS, dtype=float)
     pos_hist = np.zeros((STEPS, NUM, 3), dtype=float)
     err_hist = np.zeros((STEPS, NUM), dtype=float)
 
-    # For “paper” path plots
+    # Paper path logs
     paths_xy = [[] for _ in range(NUM)]
-    meet_indices = []  # index in path timeline where meeting happened
+    meet_indices = []
 
-    # Arrival bookkeeping
     within_tol_time = np.zeros(NUM, dtype=float)
     arrived = np.zeros(NUM, dtype=bool)
 
-    # Meeting scheduling
     next_meeting_step = MEETING_EVERY_STEPS
-
-    # Active target per drone (switches to meeting point during meeting phase)
     active_target = B.copy()
     in_meeting_mode = False
 
     # Visual markers
-    p.addUserDebugText("MEETING", [float(MEETING_POINT[0]), float(MEETING_POINT[1]), float(MEETING_POINT[2])],
-                       textColorRGB=[1, 0, 1], textSize=1.2, lifeTime=0)
+    p.addUserDebugText(
+        "MEETING",
+        [float(MEETING_POINT[0]), float(MEETING_POINT[1]), float(MEETING_POINT[2])],
+        textColorRGB=[1, 0, 1],
+        textSize=1.2,
+        lifeTime=0,
+    )
     for i in range(NUM):
-        p.addUserDebugText(f"A{i}", [float(A[i,0]), float(A[i,1]), float(A[i,2])],
-                           textColorRGB=[0, 0.7, 1], textSize=1.0, lifeTime=0)
-        p.addUserDebugText(f"B{i}", [float(B[i,0]), float(B[i,1]), float(B[i,2])],
-                           textColorRGB=[0, 1, 0], textSize=1.0, lifeTime=0)
+        p.addUserDebugText(
+            f"A{i}",
+            [float(A[i, 0]), float(A[i, 1]), float(A[i, 2])],
+            textColorRGB=[0, 0.7, 1],
+            textSize=1.0,
+            lifeTime=0,
+        )
+        p.addUserDebugText(
+            f"B{i}",
+            [float(B[i, 0]), float(B[i, 1]), float(B[i, 2])],
+            textColorRGB=[0, 1, 0],
+            textSize=1.0,
+            lifeTime=0,
+        )
 
-    # init paths
     for i in range(NUM):
         paths_xy[i].append([float(A[i, 0]), float(A[i, 1])])
 
@@ -268,16 +268,13 @@ def main():
             t = k * DT
             times[k] = t
 
-            # Decide if we should enter meeting mode
             if (not in_meeting_mode) and (k == next_meeting_step):
                 in_meeting_mode = True
                 active_target = np.tile(MEETING_POINT.reshape(1, 3), (NUM, 1)).astype(np.float32)
                 within_tol_time[:] = 0.0
                 arrived[:] = False
-                # schedule next meeting later (after this one completes)
                 next_meeting_step += MEETING_EVERY_STEPS
 
-            # Read states and compute RPM for all drones
             rpms = np.zeros((NUM, 4), dtype=np.float32)
 
             for i in range(NUM):
@@ -288,7 +285,6 @@ def main():
                 vel = state[10:13] if state.shape[0] >= 13 else np.zeros(3, dtype=np.float32)
                 ang_vel = state[13:16] if state.shape[0] >= 16 else np.zeros(3, dtype=np.float32)
 
-                # PID -> RPMs
                 out = ctrls[i].computeControl(
                     control_timestep=DT,
                     cur_pos=pos,
@@ -301,7 +297,6 @@ def main():
                 rpm = out[0] if isinstance(out, (tuple, list)) else out
                 rpms[i, :] = np.array(rpm, dtype=np.float32).reshape(4,)
 
-                # Logs
                 pos_hist[k, i, :] = pos
                 err = active_target[i] - pos
                 err_norm = float(np.linalg.norm(err))
@@ -309,12 +304,11 @@ def main():
 
                 paths_xy[i].append([float(pos[0]), float(pos[1])])
 
-                # Synthetic measurement yi at current (x,y)
+                # Measurement
                 x, y = float(pos[0]), float(pos[1])
                 true_val = float(field_f(x, y))
-
-                # Add noise (+ attack if faulty)
                 noise = np.random.normal(0.0, meas_noise_std)
+
                 if i in faulty_set:
                     attack = attack_bias * np.sin(2 * np.pi * x) * np.cos(2 * np.pi * y)
                     noise += np.random.normal(0.0, faulty_extra_noise)
@@ -322,14 +316,11 @@ def main():
                 else:
                     meas = true_val + float(noise)
 
-                # Store (xi, yi)
                 drones[i]["X"] = np.vstack([drones[i]["X"], np.array([[x, y]], dtype=float)])
                 drones[i]["y"] = np.append(drones[i]["y"], meas)
 
-            # Step env
             obs, reward, terminated, truncated, info = env.step(rpms)
 
-            # Meeting completion check (all within meeting radius)
             if in_meeting_mode:
                 all_within = True
                 for i in range(NUM):
@@ -343,7 +334,6 @@ def main():
                     all_within = all_within and arrived[i]
 
                 if all_within:
-                    # ---- MEET & SHARE HYPERS ----
                     hypers = []
                     for i in range(NUM):
                         gp = drones[i]["gp"]
@@ -353,36 +343,31 @@ def main():
                             gp.fit(X, y)
                             hypers.append(extract_hypers(gp))
                         else:
-                            # not enough points -> default-ish
                             hypers.append((1.0, 1.0, 0.2))
 
                     agg_amp, agg_ls, agg_noi = aggregate_hypers(hypers, mode=MODE, F=F)
 
                     print(
-                        f"[MEETING @ t={t:.2f}s] shared hypers (amp,ls,noi) -> fused: "
+                        f"[MEETING @ t={t:.2f}s] fused hypers: "
                         f"amp={agg_amp:.3f} ls={agg_ls:.3f} noi={agg_noi:.3f}"
                     )
 
-                    # Rebuild all GPs with fused hypers (hyperparameter consensus)
                     for i in range(NUM):
                         drones[i]["gp"] = build_gp(
                             amp=agg_amp,
                             ls=agg_ls,
                             noi=agg_noi,
-                            optimize=False,     # keep them fixed after fusion for stability
+                            optimize=False,
                             seed=10 + i,
                         )
 
-                    # mark split for “replanning after meeting” plot
                     meet_indices.append(len(paths_xy[0]) - 1)
 
-                    # Exit meeting mode -> resume goal B
                     in_meeting_mode = False
                     active_target = B.copy()
                     within_tol_time[:] = 0.0
                     arrived[:] = False
 
-            # Keep real-time feeling
             if GUI:
                 time.sleep(DT)
 
@@ -392,14 +377,12 @@ def main():
     env.close()
 
     # -----------------------------
-    # PLOTS (clear, no overlap confusion)
+    # PLOTS
     # -----------------------------
-    # Distance-to-goal vs time (to FINAL goal B, not meeting)
     dist_to_B = np.zeros((STEPS, NUM), dtype=float)
     for k in range(STEPS):
         for i in range(NUM):
-            pos = pos_hist[k, i, :]
-            dist_to_B[k, i] = float(np.linalg.norm(B[i] - pos))
+            dist_to_B[k, i] = float(np.linalg.norm(B[i] - pos_hist[k, i, :]))
 
     plt.figure(figsize=(9, 5), dpi=180)
     for i in range(NUM):
@@ -413,7 +396,6 @@ def main():
     plt.savefig(OUTDIR / "wmsr_distance.png", dpi=300, bbox_inches="tight")
     plt.close()
 
-    # x(t) vs time (each drone)
     plt.figure(figsize=(9, 5), dpi=180)
     for i in range(NUM):
         plt.plot(times, pos_hist[:, i, 0], label=f"Drone {i} x(t)")
@@ -426,7 +408,6 @@ def main():
     plt.savefig(OUTDIR / "wmsr_x.png", dpi=300, bbox_inches="tight")
     plt.close()
 
-    # XY trajectories with A and B markers
     plt.figure(figsize=(7.5, 6), dpi=180)
     for i in range(NUM):
         plt.plot(pos_hist[:, i, 0], pos_hist[:, i, 1], label=f"Drone {i}")
@@ -442,7 +423,9 @@ def main():
     plt.savefig(OUTDIR / "wmsr_xy.png", dpi=300, bbox_inches="tight")
     plt.close()
 
-    # ---- Paper-style 4 panel (robot 1/2/3 + replanning after meeting) ----
+    # -----------------------------
+    # NEW: Separate "paper-style" plots for robots 1,2,3
+    # -----------------------------
     xs, ys, Zbg = field_grid(
         xmin=min(A[:, 0].min(), B[:, 0].min()) - 0.2,
         xmax=max(A[:, 0].max(), B[:, 0].max()) + 0.2,
@@ -452,13 +435,9 @@ def main():
     )
     meet_xy = np.array([MEETING_POINT[0], MEETING_POINT[1]], dtype=float)
     meet_pts = meeting_area_points(meet_xy, w=0.35, h=0.35, step=0.06)
-
     split_idx = meet_indices[0] if len(meet_indices) else None
 
-    fig, axes = plt.subplots(1, 4, figsize=(18, 4.6), dpi=180)
-    panel_titles = ["(a) Path for robot 1", "(b) Path for robot 2", "(c) Path for robot 3", "(d) Re-planning after meeting"]
-
-    def _panel_bg(ax):
+    def draw_bg(ax):
         ax.pcolormesh(xs, ys, Zbg, shading="nearest")
         ax.set_xlabel("x")
         ax.set_ylabel("y")
@@ -466,28 +445,40 @@ def main():
         ax.scatter(meet_pts[:, 0], meet_pts[:, 1], s=10, c="red", marker=".", label="Meeting Area")
         ax.scatter([meet_xy[0]], [meet_xy[1]], s=80, marker="s", c="pink", edgecolors="k", label="Meeting Location")
 
-    # panels a/b/c for drones 1,2,3 (ids 0,1,2)
-    for j, rid in enumerate([0, 1, 2]):
-        ax = axes[j]
-        _panel_bg(ax)
-        ax.set_title(panel_titles[j])
+    def save_single_robot_path(rid: int, outname: str):
+        fig, ax = plt.subplots(1, 1, figsize=(6.3, 5.4), dpi=200)
+        draw_bg(ax)
+        ax.set_title(f"Path for robot {rid+1}")
 
-        ax.scatter([A[rid, 0]], [A[rid, 1]], s=60, c="white", edgecolors="k", label="Start")
-        ax.scatter([B[rid, 0]], [B[rid, 1]], s=60, c="lime", edgecolors="k", marker="x", label="Goal")
+        ax.scatter([A[rid, 0]], [A[rid, 1]], s=80, c="white", edgecolors="k", label="Start")
+        ax.scatter([B[rid, 0]], [B[rid, 1]], s=80, c="lime", edgecolors="k", marker="x", label="Goal")
 
         P = np.array(paths_xy[rid], dtype=float)
+        # Pre-meeting segment (like your old panels a/b/c)
         if split_idx is not None:
             P = P[: split_idx + 1]
         P = compress_path(P, keep_every=10)
+
         ax.plot(P[:, 0], P[:, 1], lw=3.0, color="black", label=f"robot{rid+1}")
         ax.scatter(P[:, 0], P[:, 1], s=18, marker="s", c="pink", alpha=0.9)
 
-        ax.legend(loc="lower right", fontsize=7, framealpha=0.9)
+        ax.legend(loc="lower right", fontsize=8, framealpha=0.9)
+        plt.tight_layout()
+        plt.savefig(OUTDIR / outname, dpi=300, bbox_inches="tight")
+        plt.close(fig)
 
-    # panel d: post-meeting segments for all drones
-    ax = axes[3]
-    _panel_bg(ax)
-    ax.set_title(panel_titles[3])
+    # Save separate figures for robots 1,2,3 (IDs 0,1,2)
+    save_single_robot_path(0, "path_robot1.png")
+    save_single_robot_path(1, "path_robot2.png")
+    save_single_robot_path(2, "path_robot3.png")
+
+    # -----------------------------
+    # Separate replanning-after-meeting plot
+    # -----------------------------
+    fig, ax = plt.subplots(1, 1, figsize=(7.2, 5.6), dpi=200)
+    draw_bg(ax)
+    ax.set_title("Re-planning after meeting (post-meeting segments)")
+
     colors = ["black", "green", "blue", "orange"]
     for i in range(NUM):
         P = np.array(paths_xy[i], dtype=float)
@@ -495,17 +486,20 @@ def main():
             P = P[split_idx:]
         P = compress_path(P, keep_every=14)
         ax.plot(P[:, 0], P[:, 1], lw=3.0, color=colors[i % len(colors)], label=f"robot{i+1}")
-    ax.legend(loc="lower right", fontsize=7, framealpha=0.9)
 
+    ax.legend(loc="lower right", fontsize=8, framealpha=0.9)
     plt.tight_layout()
-    plt.savefig(OUTDIR / "planning_paths_4panel.png", dpi=300, bbox_inches="tight")
+    plt.savefig(OUTDIR / "replanning_after_meeting.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
 
     print("\nSaved plots:")
     print(f" - {OUTDIR / 'wmsr_distance.png'}")
     print(f" - {OUTDIR / 'wmsr_x.png'}")
     print(f" - {OUTDIR / 'wmsr_xy.png'}")
-    print(f" - {OUTDIR / 'planning_paths_4panel.png'}")
+    print(f" - {OUTDIR / 'path_robot1.png'}")
+    print(f" - {OUTDIR / 'path_robot2.png'}")
+    print(f" - {OUTDIR / 'path_robot3.png'}")
+    print(f" - {OUTDIR / 'replanning_after_meeting.png'}")
 
 
 if __name__ == "__main__":
