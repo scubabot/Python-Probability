@@ -1,498 +1,511 @@
-#!/usr/bin/env python3
-"""
-W-MSR + GP hyperparameter sharing pipeline (PyBullet drones)
+# scripts/four_drones_wmsr.py
+# FULL WORKING CODE
+# - 4 drones in Gym-PyBullet (CtrlAviary) using built-in PID (DSLPIDControl)
+# - PID outputs motor RPMs -> env.step(rpms)
+# - Adds a simple "meeting + WMSR fusion" pipeline (share GP hyperparameters only)
+# - Logs + saves clear plots:
+#     - wmsr_distance.png  (distance-to-goal vs time)
+#     - wmsr_x.png         (x(t) vs time)
+#     - wmsr_xy.png        (XY trajectories with A/B markers)
+#     - planning_paths_4panel.png  (robot1/2/3 paths + replanning after meeting)
+#
+# Run:
+#   (.venv) python scripts/four_drones_wmsr.py
 
-PIPELINE (REPEATS):
-(1) Start: all 3 drones at SAME point
-(2) Explore: go to exploration targets, collect measurements
-(3) Meet: go to meeting point, HOLD until all reached
-(4) Share: fit local GP -> hyperparams -> W-MSR fuse
-(5) Replan: use fused GP to pick new exploration targets (high variance)
-(6) Explore again
-
-Works with gym-pybullet-drones version differences via constructor adapter.
-
-Outputs:
-- pipeline_paths.png
-- fused_variance_map_cycleX.png (optional)
-"""
-
-import os
 import time
-import math
-import inspect
+from pathlib import Path
+
 import numpy as np
 import matplotlib.pyplot as plt
 
-from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import ConstantKernel, RBF, WhiteKernel
-
+import pybullet as p
 from gym_pybullet_drones.envs.CtrlAviary import CtrlAviary
 from gym_pybullet_drones.utils.enums import DroneModel, Physics
+from gym_pybullet_drones.control.DSLPIDControl import DSLPIDControl
 
-try:
-    from gym_pybullet_drones.control.DSLPIDControl import DSLPIDControl
-except Exception:
-    from gym_pybullet_drones.control.DSLPIDControl import DSLPIDControl
-
-# Optional enums (depend on version)
-try:
-    from gym_pybullet_drones.utils.enums import ObservationType, ActionType
-except Exception:
-    ObservationType, ActionType = None, None
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import Matern, ConstantKernel as C, WhiteKernel
 
 
 # -----------------------------
-# Robust env constructor
+# Synthetic scalar field (virtual sensor)
+# yi = f(x,y) + noise (+ attack for faulty)
 # -----------------------------
-def _sig_has(name: str, sig: inspect.Signature) -> bool:
-    return name in sig.parameters
-
-def make_ctrl_aviary(num_drones: int, gui: bool, initial_xyzs: np.ndarray):
-    sig = inspect.signature(CtrlAviary.__init__)
-    kwargs = {}
-
-    if _sig_has("drone_model", sig): kwargs["drone_model"] = DroneModel.CF2X
-    if _sig_has("num_drones", sig): kwargs["num_drones"] = num_drones
-    if _sig_has("physics", sig): kwargs["physics"] = Physics.PYB
-    if _sig_has("gui", sig): kwargs["gui"] = gui
-    if _sig_has("record", sig): kwargs["record"] = False
-    if _sig_has("obstacles", sig): kwargs["obstacles"] = False
-    if _sig_has("user_debug_gui", sig): kwargs["user_debug_gui"] = gui
-
-    if _sig_has("initial_xyzs", sig):
-        kwargs["initial_xyzs"] = initial_xyzs
-    elif _sig_has("initial_xyz", sig):
-        kwargs["initial_xyz"] = initial_xyzs
-
-    if _sig_has("initial_rpys", sig):
-        kwargs["initial_rpys"] = np.zeros((num_drones, 3))
-
-    # Frequencies (best-effort)
-    if _sig_has("pyb_freq", sig): kwargs["pyb_freq"] = 240
-    if _sig_has("ctrl_freq", sig): kwargs["ctrl_freq"] = 48
-    if _sig_has("freq", sig): kwargs["freq"] = 48
-    if _sig_has("aggregate_phy_steps", sig): kwargs["aggregate_phy_steps"] = 5
-
-    # Obs/act types (only if supported)
-    if ObservationType is not None:
-        if _sig_has("obs", sig): kwargs["obs"] = ObservationType.KIN
-        if _sig_has("observation_type", sig): kwargs["observation_type"] = ObservationType.KIN
-
-    if ActionType is not None:
-        if _sig_has("act", sig): kwargs["act"] = ActionType.RPM
-        if _sig_has("action_type", sig): kwargs["action_type"] = ActionType.RPM
-
-    return CtrlAviary(**kwargs)
-
-
-# -----------------------------
-# State reading + control actions
-# -----------------------------
-def read_states(env, obs, N):
-    states = []
-    for i in range(N):
-        try:
-            s = env._getDroneStateVector(i)
-            pos = np.array(s[0:3])
-            quat = np.array(s[3:7])
-            rpy = np.array(s[7:10]) if len(s) >= 10 else np.zeros(3)
-            vel = np.array(s[10:13]) if len(s) >= 13 else np.zeros(3)
-            ang_vel = np.array(s[13:16]) if len(s) >= 16 else np.zeros(3)
-        except Exception:
-            # fallback: assume obs[i][0:3] is pos
-            pos = np.array(obs[i][0:3])
-            quat = np.array([1,0,0,0], float)
-            rpy = np.zeros(3)
-            vel = np.zeros(3)
-            ang_vel = np.zeros(3)
-
-        states.append({"pos":pos, "quat":quat, "rpy":rpy, "vel":vel, "ang_vel":ang_vel})
-    return states
-
-def pid_rpm_action(ctrls, states, targets_xyz, dt):
-    N = len(ctrls)
-    action = np.zeros((N,4), dtype=np.float32)
-
-    for i in range(N):
-        rpm, _, _ = ctrls[i].computeControl(
-            control_timestep=dt,
-            cur_pos=states[i]["pos"],
-            cur_quat=states[i]["quat"],
-            cur_vel=states[i]["vel"],
-            cur_ang_vel=states[i]["ang_vel"],
-            target_pos=targets_xyz[i],
-            target_rpy=np.array([0.0,0.0,0.0])
-        )
-        action[i,:] = rpm
-    return action
-
-def fly_hold_targets(env, ctrls, targets_xyz, reached_tol_xy=0.25, max_steps=2500, gui=False, label="[fly]"):
-    """
-    HOLD targets until all drones reach XY tolerance (hard guarantee unless timeout).
-    Returns reached(bool), trajectory list of positions.
-    """
-    N = targets_xyz.shape[0]
-    dt = 1.0/48.0
-    try:
-        if hasattr(env, "CTRL_FREQ"):
-            dt = 1.0/float(env.CTRL_FREQ)
-    except Exception:
-        pass
-
-    traj = []
-    obs, _ = env.reset()
-
-    for step in range(max_steps):
-        states = read_states(env, obs, N)
-        pos = np.stack([st["pos"] for st in states], axis=0)
-        traj.append(pos.copy())
-
-        dxy = np.linalg.norm(pos[:,0:2] - targets_xyz[:,0:2], axis=1)
-        max_dist = float(np.max(dxy))
-        min_dist = float(np.min(dxy))
-
-        if step % 100 == 0:
-            print(f"{label} step={step:4d} max_dist={max_dist:.3f} min_dist={min_dist:.3f} targets={targets_xyz[0,0:2]}")
-
-        if max_dist <= reached_tol_xy:
-            return True, traj
-
-        action = pid_rpm_action(ctrls, states, targets_xyz, dt)
-        obs, reward, terminated, truncated, info = env.step(action)
-
-        if gui:
-            time.sleep(dt)
-        if terminated or truncated:
-            break
-
-    return False, traj
-
-
-# -----------------------------
-# Synthetic field + sensing
-# -----------------------------
-def true_field(xy):
-    """Synthetic smooth 2D field; think 'temperature'."""
-    x, y = xy
-    return (np.sin(1.2*x)*np.cos(1.0*y) + 0.35*np.cos(2.0*x + 0.7*y))
-
-def sense_field_at_positions(pos_xyz, noise_std=0.02, rng=None):
-    rng = np.random.default_rng() if rng is None else rng
-    ys = []
-    for p in pos_xyz:
-        val = true_field(p[0:2]) + rng.normal(0.0, noise_std)
-        ys.append(val)
-    return np.array(ys, dtype=float)
-
-
-# -----------------------------
-# GP fit + hyperparam extraction
-# -----------------------------
-def fit_gp_and_get_hyperparams(X, y):
-    """
-    Fit GP and return hyperparams:
-      amp (signal std), length_scale, noise_std
-    """
-    # kernel = C * RBF + White
-    kernel = ConstantKernel(1.0, (1e-2, 1e2)) * RBF(length_scale=0.5, length_scale_bounds=(1e-2, 1e2)) \
-             + WhiteKernel(noise_level=1e-3, noise_level_bounds=(1e-6, 1e-1))
-
-    gp = GaussianProcessRegressor(
-        kernel=kernel,
-        normalize_y=True,
-        n_restarts_optimizer=2,
-        random_state=0
+def field_f(x: float, y: float) -> float:
+    # Smooth, nontrivial field (like temperature/gas concentration)
+    return (
+        1.2 * np.sin(0.8 * x)
+        + 0.9 * np.cos(0.6 * y)
+        + 0.6 * np.sin(0.35 * x * y)
     )
-    gp.fit(X, y)
 
-    # Extract
+
+# -----------------------------
+# GP helpers (same idea as your python mapping code)
+# Each drone fits GP locally and extracts hypers (amp, ls, noi)
+# -----------------------------
+def build_gp(amp=1.0, ls=1.0, noi=0.2, *, optimize=True, seed=0):
+    kernel = (
+        C(amp, (1e-3, 1e3))
+        * Matern(length_scale=ls, length_scale_bounds=(1e-2, 1e2), nu=1.5)
+        + WhiteKernel(noise_level=noi, noise_level_bounds=(1e-6, 1e2))
+    )
+    return GaussianProcessRegressor(
+        kernel=kernel,
+        normalize_y=False,
+        n_restarts_optimizer=3 if optimize else 0,
+        optimizer="fmin_l_bfgs_b" if optimize else None,
+        random_state=seed,
+    )
+
+
+def extract_hypers(gp: GaussianProcessRegressor):
     k = gp.kernel_
-    # Typical structure: (C*RBF) + White
-    # k.k1 is (C*RBF), k.k2 is White
-    amp = math.sqrt(float(k.k1.k1.constant_value))  # signal std
+    amp = float(k.k1.k1.constant_value)
     ls = float(k.k1.k2.length_scale)
-    noise_std = math.sqrt(float(k.k2.noise_level))
+    noi = float(k.k2.noise_level)
+    return amp, ls, noi
 
-    return gp, np.array([amp, ls, noise_std], dtype=float)
+
+def wmsr(vals, F: int):
+    vals = sorted([float(v) for v in vals])
+    n = len(vals)
+    if n == 0:
+        return 0.0
+    if 2 * F >= n:
+        return float(np.mean(vals))
+    return float(np.mean(vals[F : n - F]))
 
 
-# -----------------------------
-# W-MSR (trimmed mean) fusion for hyperparams
-# -----------------------------
-def wmsr_fuse(hparams_matrix, F=1):
-    """
-    hparams_matrix: shape (N, D) where D=3 (amp, ls, noise)
-    W-MSR rule per dimension:
-      - sort values
-      - trim F lowest and F highest
-      - average remaining
-    """
-    N, D = hparams_matrix.shape
-    fused = np.zeros(D, dtype=float)
-
-    for d in range(D):
-        vals = np.sort(hparams_matrix[:, d])
-        if 2*F >= N:
-            # can't trim, fallback to median
-            fused[d] = np.median(vals)
-        else:
-            fused[d] = np.mean(vals[F:N-F])
-
-    return fused
+def aggregate_hypers(hypers_list, mode="wmsr", F=1):
+    amps = [h[0] for h in hypers_list]
+    lss = [h[1] for h in hypers_list]
+    nois = [h[2] for h in hypers_list]
+    if mode == "mean":
+        return float(np.mean(amps)), float(np.mean(lss)), float(np.mean(nois))
+    if mode == "wmsr":
+        return wmsr(amps, F), wmsr(lss, F), wmsr(nois, F)
+    raise ValueError("mode must be 'mean' or 'wmsr'")
 
 
 # -----------------------------
-# Replan using fused GP: pick high-variance points
+# Plot helpers (paper-ish paths)
 # -----------------------------
-def build_gp_from_fused_hparams(fused, X, y):
-    """
-    Build a GP using *fixed* fused hyperparams (no re-optimization).
-    """
-    amp, ls, noise_std = fused
-    kernel = ConstantKernel(amp**2) * RBF(length_scale=ls) + WhiteKernel(noise_level=noise_std**2)
+def field_grid(xmin=0.0, xmax=2.0, ymin=0.0, ymax=1.2, n=60):
+    xs = np.linspace(xmin, xmax, n)
+    ys = np.linspace(ymin, ymax, n)
+    XX, YY = np.meshgrid(xs, ys)
+    Z = field_f(XX, YY)
+    return xs, ys, Z
 
-    gp = GaussianProcessRegressor(kernel=kernel, optimizer=None, normalize_y=True)
-    gp.fit(X, y)
-    return gp
 
-def pick_high_variance_targets(gp, bounds=(-2,2), grid_n=35, k=3, min_sep=0.6, rng=None):
-    """
-    Pick k targets in XY at highest predictive std, with separation.
-    """
-    rng = np.random.default_rng() if rng is None else rng
-    xs = np.linspace(bounds[0], bounds[1], grid_n)
-    ys = np.linspace(bounds[0], bounds[1], grid_n)
-    Xg, Yg = np.meshgrid(xs, ys)
-    pts = np.stack([Xg.ravel(), Yg.ravel()], axis=1)
+def meeting_area_points(center_xy, w=0.35, h=0.35, step=0.06):
+    cx, cy = float(center_xy[0]), float(center_xy[1])
+    xs = np.arange(cx - w / 2, cx + w / 2 + 1e-9, step)
+    ys = np.arange(cy - h / 2, cy + h / 2 + 1e-9, step)
+    XX, YY = np.meshgrid(xs, ys)
+    return np.c_[XX.ravel(), YY.ravel()]
 
-    _, std = gp.predict(pts, return_std=True)
-    order = np.argsort(-std)  # descending
-    chosen = []
-    for idx in order:
-        p = pts[idx]
-        if all(np.linalg.norm(p - c) >= min_sep for c in chosen):
-            chosen.append(p)
-        if len(chosen) >= k:
-            break
 
-    chosen = np.array(chosen, float)
-    return chosen, (xs, ys, std.reshape(grid_n, grid_n))
+def compress_path(P, keep_every=8):
+    P = np.asarray(P, dtype=float)
+    if P.shape[0] <= 2:
+        return P
+    idx = np.arange(0, P.shape[0], keep_every, dtype=int)
+    if idx[-1] != P.shape[0] - 1:
+        idx = np.append(idx, P.shape[0] - 1)
+    return P[idx]
 
 
 # -----------------------------
-# Plotting
+# Env state compatibility
 # -----------------------------
-def plot_paths(paths_xyz, meeting_point, outpath, title):
-    """
-    paths_xyz: list of arrays (T,N,3) or one concatenated array
-    """
-    if isinstance(paths_xyz, list):
-        P = np.concatenate(paths_xyz, axis=0)
-    else:
-        P = paths_xyz
-
-    T, N, _ = P.shape
-    ds = max(1, T // 200)  # downsample for clean plot
-    P = P[::ds]
-
-    plt.figure(figsize=(8,7))
-    plt.title(title)
-    plt.xlabel("X"); plt.ylabel("Y")
-    plt.axis("equal")
-    plt.xlim(-2,2); plt.ylim(-2,2)
-
-    # Background: true field
-    xs = np.linspace(-2,2,60)
-    ys = np.linspace(-2,2,60)
-    X, Y = np.meshgrid(xs, ys)
-    Z = np.sin(1.2*X)*np.cos(1.0*Y) + 0.35*np.cos(2.0*X + 0.7*Y)
-    plt.imshow(Z, extent=[-2,2,-2,2], origin="lower", alpha=0.85)
-
-    colors = ["k","g","tab:blue"]
-
-    # Start
-    plt.scatter([P[0,0,0]],[P[0,0,1]], s=120, facecolor="w", edgecolor="k", label="Start")
-
-    # Meeting point
-    plt.scatter([meeting_point[0]],[meeting_point[1]], s=140, marker="s", edgecolor="k", label="Meeting")
-
-    for i in range(N):
-        plt.plot(P[:,i,0], P[:,i,1], linewidth=2.5, color=colors[i], label=f"drone{i}")
-
-    plt.legend(loc="center left", bbox_to_anchor=(1.02, 0.5))
-    plt.tight_layout()
-    plt.savefig(outpath, dpi=200)
-    plt.close()
-    print(f"[plot] saved: {outpath}")
-
-def plot_variance_map(xs, ys, std_grid, targets, outpath, title):
-    plt.figure(figsize=(7,6))
-    plt.title(title)
-    plt.xlabel("X"); plt.ylabel("Y")
-    plt.imshow(std_grid, extent=[xs.min(), xs.max(), ys.min(), ys.max()], origin="lower", aspect="equal")
-    plt.scatter(targets[:,0], targets[:,1], s=120, facecolor="none", edgecolor="w", linewidth=2)
-    plt.tight_layout()
-    plt.savefig(outpath, dpi=200)
-    plt.close()
-    print(f"[plot] saved: {outpath}")
+def get_state_vector(env, i: int):
+    if hasattr(env, "getDroneStateVector"):
+        return env.getDroneStateVector(i)
+    return env._getDroneStateVector(i)
 
 
 # -----------------------------
-# MAIN PIPELINE
+# MAIN
 # -----------------------------
 def main():
-    # ===== Settings =====
-    N = 3
-    gui = True
-    Z = 1.0
-    rng = np.random.default_rng(7)
+    OUTDIR = Path(".")
+    OUTDIR.mkdir(exist_ok=True)
 
-    START_XYZ = np.array([0.0, 0.0, Z])              # SAME start for all
-    MEETING_XY = np.array([1.2, 1.2], dtype=float)   # meeting point
-    meeting_xyz = np.array([MEETING_XY[0], MEETING_XY[1], Z], dtype=float)
+    # ---------- SIM SETTINGS ----------
+    NUM = 4
+    CTRL_FREQ = 240
+    DT = 1.0 / CTRL_FREQ
+    DURATION_SEC = 20.0
+    STEPS = int(DURATION_SEC * CTRL_FREQ)
 
-    # Fault model
-    faulty_set = {2}   # drone index that lies about hyperparams
-    F = 1              # W-MSR trims 1 lowest & 1 highest (works for N=3)
+    GUI = True
+    DRONE_MODEL = DroneModel.CF2X
+    PHY = Physics.PYB
 
-    # Exploration cycles
-    CYCLES = 2
-    EXPLORATION_POINTS_PER_CYCLE = 3
+    # Reach/settle detection
+    TOL = 0.12          # meters
+    SETTLE_SEC = 1.0    # seconds within tolerance before "arrived"
 
-    # ===== Init env =====
-    initial_xyzs = np.vstack([START_XYZ for _ in range(N)])
-    env = make_ctrl_aviary(N, gui, initial_xyzs)
-    ctrls = [DSLPIDControl(drone_model=DroneModel.CF2X) for _ in range(N)]
+    # ---------- A (starts) and B (goals) ----------
+    A = np.array(
+        [
+            [0.0, 0.0, 1.0],
+            [0.0, 0.4, 1.0],
+            [0.4, 0.0, 1.0],
+            [0.4, 0.4, 1.0],
+        ],
+        dtype=np.float32,
+    )
 
-    # Data buffers per drone
-    X_data = [ [] for _ in range(N) ]  # list of xy
-    y_data = [ [] for _ in range(N) ]  # list of scalar
+    B = np.array(
+        [
+            [1.0, 0.5, 1.2],
+            [1.0, 0.9, 1.2],
+            [1.6, 0.5, 1.6],
+            [1.2, 0.9, 1.2],
+        ],
+        dtype=np.float32,
+    )
 
-    all_trajs = []
+    TARGET_RPY = np.zeros((NUM, 3), dtype=np.float32)  # [roll,pitch,yaw] targets
+    TARGET_RPY[:, 2] = 0.0
 
-    # ===== Phase 0: stabilize hover at start =====
-    print("[phase0] takeoff/stabilize at start...")
-    start_targets = initial_xyzs.copy()
-    reached, traj0 = fly_hold_targets(env, ctrls, start_targets, reached_tol_xy=0.35, max_steps=600, gui=gui, label="[start]")
-    all_trajs.append(np.array(traj0))
+    # ---------- MEETING SETTINGS ----------
+    # We force a rendezvous at this XY and do WMSR fusion there.
+    MEETING_POINT = np.array([0.75, 0.60, 1.20], dtype=np.float32)
+    MEETING_EVERY_SEC = 6.0
+    MEETING_EVERY_STEPS = int(MEETING_EVERY_SEC * CTRL_FREQ)
+    MEETING_RADIUS = 0.15  # meters
 
-    # collect a first measurement at start
-    pos0 = traj0[-1]
-    meas0 = sense_field_at_positions(pos0, noise_std=0.02, rng=rng)
-    for i in range(N):
-        X_data[i].append(pos0[i,0:2].copy())
-        y_data[i].append(float(meas0[i]))
+    # ---------- WMSR / FAULT MODEL ----------
+    # With N=4, a reasonable trim is F=1 (drop smallest + largest, average middle 2)
+    MODE = "wmsr"
+    F = 1
 
-    fused_hparams = None
+    # Choose one faulty agent (biasing its measurement)
+    faulty_set = {2}          # change if you want
+    attack_bias = 2.5         # adds spatial bias
+    meas_noise_std = 0.05     # all drones noise
+    faulty_extra_noise = 0.15 # extra noisy for faulty
 
-    # ===== Repeat cycles =====
-    for cyc in range(1, CYCLES+1):
-        print(f"\n================= CYCLE {cyc} =================")
+    print("4-Drone PID A -> B demo + meeting/WMSR fusion (PID outputs RPMs, env takes RPMs).")
+    print("A:\n", A)
+    print("B:\n", B)
+    print(f"tol={TOL}m duration={DURATION_SEC}s freq={CTRL_FREQ}Hz")
+    print(f"meeting every {MEETING_EVERY_SEC}s at {MEETING_POINT[:2].tolist()}  (radius {MEETING_RADIUS}m)")
+    print(f"faulty agents = {sorted(list(faulty_set))} | fusion={MODE} F={F}")
+    print("Tip: close the PyBullet window or press Ctrl+C to stop.\n")
 
-        # ---- (1) Exploration targets ----
-        # First cycle: random exploration; later cycles: high-variance targets from fused GP
-        if fused_hparams is None:
-            # random but deterministic exploration
-            targets_xy = rng.uniform(-1.8, 1.8, size=(EXPLORATION_POINTS_PER_CYCLE, 2))
-        else:
-            # Build a global dataset for fused GP planning (use all non-faulty data OR all data)
-            Xg = np.vstack([np.array(X_data[i]) for i in range(N)])
-            yg = np.hstack([np.array(y_data[i]) for i in range(N)])
-            gp_fused = build_gp_from_fused_hparams(fused_hparams, Xg, yg)
-            targets_xy, (xs, ys, std_grid) = pick_high_variance_targets(gp_fused, bounds=(-2,2), grid_n=35, k=EXPLORATION_POINTS_PER_CYCLE, min_sep=0.8, rng=rng)
+    # ---------- ENV ----------
+    env = CtrlAviary(
+        drone_model=DRONE_MODEL,
+        num_drones=NUM,
+        initial_xyzs=A,
+        initial_rpys=TARGET_RPY,
+        physics=PHY,
+        gui=GUI,
+        record=False,
+        ctrl_freq=CTRL_FREQ,  # <-- correct for CtrlAviary
+    )
+    obs, info = env.reset()
 
-            plot_variance_map(xs, ys, std_grid, targets_xy,
-                              outpath=f"fused_variance_map_cycle{cyc}.png",
-                              title=f"Fused GP std map (cycle {cyc})")
+    # ---------- CONTROLLERS ----------
+    ctrls = [DSLPIDControl(drone_model=DRONE_MODEL) for _ in range(NUM)]
 
-        # Assign exploration points to drones (simple: each point becomes a waypoint all drones visit in different order)
-        # We create per-drone target sequence by rotating order
-        per_drone_sequences = []
-        for i in range(N):
-            seq = np.roll(targets_xy, shift=i, axis=0)
-            per_drone_sequences.append(seq)
+    # ---------- LOCAL GP STATE PER DRONE ----------
+    # Each drone stores (xi, yi) in 2D (x,y) and fits GP
+    drones = []
+    for i in range(NUM):
+        gp = build_gp(optimize=True, seed=10 + i)
+        X = np.empty((0, 2), dtype=float)
+        y = np.empty((0,), dtype=float)
+        drones.append(
+            {
+                "id": i,
+                "gp": gp,
+                "X": X,
+                "y": y,
+            }
+        )
 
-        # ---- (2) Explore: go waypoint by waypoint ----
-        print("[explore] moving and sensing...")
-        for wp_idx in range(EXPLORATION_POINTS_PER_CYCLE):
-            targets_xyz = np.zeros((N,3), dtype=float)
-            for i in range(N):
-                targets_xyz[i,0:2] = per_drone_sequences[i][wp_idx]
-                targets_xyz[i,2] = Z
+    # ---------- LOGS ----------
+    times = np.zeros(STEPS, dtype=float)
+    pos_hist = np.zeros((STEPS, NUM, 3), dtype=float)
+    err_hist = np.zeros((STEPS, NUM), dtype=float)
 
-            reached, traj = fly_hold_targets(env, ctrls, targets_xyz,
-                                            reached_tol_xy=0.30, max_steps=2200,
-                                            gui=gui, label=f"[explore{cyc}.{wp_idx}]")
-            all_trajs.append(np.array(traj))
+    # For “paper” path plots
+    paths_xy = [[] for _ in range(NUM)]
+    meet_indices = []  # index in path timeline where meeting happened
 
-            # sense + store data at end of waypoint
-            pos = traj[-1]
-            meas = sense_field_at_positions(pos, noise_std=0.02, rng=rng)
-            for i in range(N):
-                X_data[i].append(pos[i,0:2].copy())
-                y_data[i].append(float(meas[i]))
+    # Arrival bookkeeping
+    within_tol_time = np.zeros(NUM, dtype=float)
+    arrived = np.zeros(NUM, dtype=bool)
 
-        # ---- (3) Meet: HARD hold at meeting point until reached ----
-        print("[meet] going to meeting point and HOLD...")
-        meet_targets = np.vstack([meeting_xyz for _ in range(N)])
-        reached, traj_meet = fly_hold_targets(env, ctrls, meet_targets,
-                                             reached_tol_xy=0.25, max_steps=3500,
-                                             gui=gui, label=f"[meet{cyc}]")
-        print(f"[meet] reached={reached}")
-        all_trajs.append(np.array(traj_meet))
+    # Meeting scheduling
+    next_meeting_step = MEETING_EVERY_STEPS
 
-        # ---- (4) Share hyperparams at meeting: local GP fit -> WMSR fuse ----
-        print("[share] fitting local GPs and fusing hyperparams with W-MSR...")
-        local_hparams = np.zeros((N,3), dtype=float)
+    # Active target per drone (switches to meeting point during meeting phase)
+    active_target = B.copy()
+    in_meeting_mode = False
 
-        for i in range(N):
-            Xi = np.array(X_data[i])
-            yi = np.array(y_data[i])
-            gp_i, h_i = fit_gp_and_get_hyperparams(Xi, yi)
+    # Visual markers
+    p.addUserDebugText("MEETING", [float(MEETING_POINT[0]), float(MEETING_POINT[1]), float(MEETING_POINT[2])],
+                       textColorRGB=[1, 0, 1], textSize=1.2, lifeTime=0)
+    for i in range(NUM):
+        p.addUserDebugText(f"A{i}", [float(A[i,0]), float(A[i,1]), float(A[i,2])],
+                           textColorRGB=[0, 0.7, 1], textSize=1.0, lifeTime=0)
+        p.addUserDebugText(f"B{i}", [float(B[i,0]), float(B[i,1]), float(B[i,2])],
+                           textColorRGB=[0, 1, 0], textSize=1.0, lifeTime=0)
 
-            # Faulty agent lies about hyperparams
-            if i in faulty_set:
-                # exaggerate amp and length-scale, mess with noise
-                h_i = np.array([h_i[0]*5.0, h_i[1]*8.0, max(1e-3, h_i[2]*0.1)], dtype=float)
-                print(f"  drone{i} is FAULTY -> sending bad h={h_i}")
-            else:
-                print(f"  drone{i} honest -> h={h_i}")
+    # init paths
+    for i in range(NUM):
+        paths_xy[i].append([float(A[i, 0]), float(A[i, 1])])
 
-            local_hparams[i,:] = h_i
-
-        fused_hparams = wmsr_fuse(local_hparams, F=F)
-        print(f"[WMSR] fused_hparams = (amp={fused_hparams[0]:.3f}, ls={fused_hparams[1]:.3f}, noise={fused_hparams[2]:.6f})")
-
-        # ---- (5) Explore again after meeting (pipeline requirement) ----
-        # We'll do a short post-meeting exploration hop to prove "meet -> fuse -> explore again"
-        print("[post] short exploration after fusion...")
-        post_xy = rng.uniform(-1.6, 1.6, size=(N,2))
-        post_targets = np.hstack([post_xy, Z*np.ones((N,1))])
-        reached, traj_post = fly_hold_targets(env, ctrls, post_targets,
-                                             reached_tol_xy=0.30, max_steps=2000,
-                                             gui=gui, label=f"[post{cyc}]")
-        all_trajs.append(np.array(traj_post))
-
-        # sense + store
-        pos = traj_post[-1]
-        meas = sense_field_at_positions(pos, noise_std=0.02, rng=rng)
-        for i in range(N):
-            X_data[i].append(pos[i,0:2].copy())
-            y_data[i].append(float(meas[i]))
-
-    # ===== Close env =====
     try:
-        env.close()
-    except Exception:
-        pass
+        for k in range(STEPS):
+            t = k * DT
+            times[k] = t
 
-    # ===== Plot paths =====
-    P = np.concatenate(all_trajs, axis=0)
-    plot_paths(P, MEETING_XY, outpath="pipeline_paths.png",
-               title="W-MSR pipeline: start same point → explore → meet → WMSR fuse → explore again")
+            # Decide if we should enter meeting mode
+            if (not in_meeting_mode) and (k == next_meeting_step):
+                in_meeting_mode = True
+                active_target = np.tile(MEETING_POINT.reshape(1, 3), (NUM, 1)).astype(np.float32)
+                within_tol_time[:] = 0.0
+                arrived[:] = False
+                # schedule next meeting later (after this one completes)
+                next_meeting_step += MEETING_EVERY_STEPS
 
-    print("\n[done] outputs: pipeline_paths.png (+ variance maps if fused cycles)")
+            # Read states and compute RPM for all drones
+            rpms = np.zeros((NUM, 4), dtype=np.float32)
+
+            for i in range(NUM):
+                state = np.array(get_state_vector(env, i), dtype=np.float32)
+
+                pos = state[0:3]
+                quat = state[3:7]
+                vel = state[10:13] if state.shape[0] >= 13 else np.zeros(3, dtype=np.float32)
+                ang_vel = state[13:16] if state.shape[0] >= 16 else np.zeros(3, dtype=np.float32)
+
+                # PID -> RPMs
+                out = ctrls[i].computeControl(
+                    control_timestep=DT,
+                    cur_pos=pos,
+                    cur_quat=quat,
+                    cur_vel=vel,
+                    cur_ang_vel=ang_vel,
+                    target_pos=active_target[i],
+                    target_rpy=TARGET_RPY[i],
+                )
+                rpm = out[0] if isinstance(out, (tuple, list)) else out
+                rpms[i, :] = np.array(rpm, dtype=np.float32).reshape(4,)
+
+                # Logs
+                pos_hist[k, i, :] = pos
+                err = active_target[i] - pos
+                err_norm = float(np.linalg.norm(err))
+                err_hist[k, i] = err_norm
+
+                paths_xy[i].append([float(pos[0]), float(pos[1])])
+
+                # Synthetic measurement yi at current (x,y)
+                x, y = float(pos[0]), float(pos[1])
+                true_val = float(field_f(x, y))
+
+                # Add noise (+ attack if faulty)
+                noise = np.random.normal(0.0, meas_noise_std)
+                if i in faulty_set:
+                    attack = attack_bias * np.sin(2 * np.pi * x) * np.cos(2 * np.pi * y)
+                    noise += np.random.normal(0.0, faulty_extra_noise)
+                    meas = true_val + float(attack) + float(noise)
+                else:
+                    meas = true_val + float(noise)
+
+                # Store (xi, yi)
+                drones[i]["X"] = np.vstack([drones[i]["X"], np.array([[x, y]], dtype=float)])
+                drones[i]["y"] = np.append(drones[i]["y"], meas)
+
+            # Step env
+            obs, reward, terminated, truncated, info = env.step(rpms)
+
+            # Meeting completion check (all within meeting radius)
+            if in_meeting_mode:
+                all_within = True
+                for i in range(NUM):
+                    if err_hist[k, i] <= MEETING_RADIUS:
+                        within_tol_time[i] += DT
+                    else:
+                        within_tol_time[i] = 0.0
+
+                    if within_tol_time[i] >= SETTLE_SEC:
+                        arrived[i] = True
+                    all_within = all_within and arrived[i]
+
+                if all_within:
+                    # ---- MEET & SHARE HYPERS ----
+                    hypers = []
+                    for i in range(NUM):
+                        gp = drones[i]["gp"]
+                        X = drones[i]["X"]
+                        y = drones[i]["y"]
+                        if X.shape[0] >= 5:
+                            gp.fit(X, y)
+                            hypers.append(extract_hypers(gp))
+                        else:
+                            # not enough points -> default-ish
+                            hypers.append((1.0, 1.0, 0.2))
+
+                    agg_amp, agg_ls, agg_noi = aggregate_hypers(hypers, mode=MODE, F=F)
+
+                    print(
+                        f"[MEETING @ t={t:.2f}s] shared hypers (amp,ls,noi) -> fused: "
+                        f"amp={agg_amp:.3f} ls={agg_ls:.3f} noi={agg_noi:.3f}"
+                    )
+
+                    # Rebuild all GPs with fused hypers (hyperparameter consensus)
+                    for i in range(NUM):
+                        drones[i]["gp"] = build_gp(
+                            amp=agg_amp,
+                            ls=agg_ls,
+                            noi=agg_noi,
+                            optimize=False,     # keep them fixed after fusion for stability
+                            seed=10 + i,
+                        )
+
+                    # mark split for “replanning after meeting” plot
+                    meet_indices.append(len(paths_xy[0]) - 1)
+
+                    # Exit meeting mode -> resume goal B
+                    in_meeting_mode = False
+                    active_target = B.copy()
+                    within_tol_time[:] = 0.0
+                    arrived[:] = False
+
+            # Keep real-time feeling
+            if GUI:
+                time.sleep(DT)
+
+    except KeyboardInterrupt:
+        print("Stopped by user.")
+
+    env.close()
+
+    # -----------------------------
+    # PLOTS (clear, no overlap confusion)
+    # -----------------------------
+    # Distance-to-goal vs time (to FINAL goal B, not meeting)
+    dist_to_B = np.zeros((STEPS, NUM), dtype=float)
+    for k in range(STEPS):
+        for i in range(NUM):
+            pos = pos_hist[k, i, :]
+            dist_to_B[k, i] = float(np.linalg.norm(B[i] - pos))
+
+    plt.figure(figsize=(9, 5), dpi=180)
+    for i in range(NUM):
+        plt.plot(times, dist_to_B[:, i], label=f"Drone {i}")
+    plt.axhline(TOL, linestyle="--", linewidth=1, label="tolerance")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Distance to goal ||e|| (m)")
+    plt.title("4 drones: distance-to-goal vs time")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(OUTDIR / "wmsr_distance.png", dpi=300, bbox_inches="tight")
+    plt.close()
+
+    # x(t) vs time (each drone)
+    plt.figure(figsize=(9, 5), dpi=180)
+    for i in range(NUM):
+        plt.plot(times, pos_hist[:, i, 0], label=f"Drone {i} x(t)")
+        plt.axhline(float(B[i, 0]), linestyle="--", linewidth=1)
+    plt.xlabel("Time (s)")
+    plt.ylabel("x position (m)")
+    plt.title("4 drones: x(t) vs time")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(OUTDIR / "wmsr_x.png", dpi=300, bbox_inches="tight")
+    plt.close()
+
+    # XY trajectories with A and B markers
+    plt.figure(figsize=(7.5, 6), dpi=180)
+    for i in range(NUM):
+        plt.plot(pos_hist[:, i, 0], pos_hist[:, i, 1], label=f"Drone {i}")
+        plt.scatter([A[i, 0]], [A[i, 1]], marker="o")
+        plt.scatter([B[i, 0]], [B[i, 1]], marker="x")
+    plt.scatter([MEETING_POINT[0]], [MEETING_POINT[1]], marker="s", s=90, label="Meeting")
+    plt.xlabel("x (m)")
+    plt.ylabel("y (m)")
+    plt.title("4 drones: XY trajectories (A=o, B=x)")
+    plt.axis("equal")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(OUTDIR / "wmsr_xy.png", dpi=300, bbox_inches="tight")
+    plt.close()
+
+    # ---- Paper-style 4 panel (robot 1/2/3 + replanning after meeting) ----
+    xs, ys, Zbg = field_grid(
+        xmin=min(A[:, 0].min(), B[:, 0].min()) - 0.2,
+        xmax=max(A[:, 0].max(), B[:, 0].max()) + 0.2,
+        ymin=min(A[:, 1].min(), B[:, 1].min()) - 0.2,
+        ymax=max(A[:, 1].max(), B[:, 1].max()) + 0.2,
+        n=70,
+    )
+    meet_xy = np.array([MEETING_POINT[0], MEETING_POINT[1]], dtype=float)
+    meet_pts = meeting_area_points(meet_xy, w=0.35, h=0.35, step=0.06)
+
+    split_idx = meet_indices[0] if len(meet_indices) else None
+
+    fig, axes = plt.subplots(1, 4, figsize=(18, 4.6), dpi=180)
+    panel_titles = ["(a) Path for robot 1", "(b) Path for robot 2", "(c) Path for robot 3", "(d) Re-planning after meeting"]
+
+    def _panel_bg(ax):
+        ax.pcolormesh(xs, ys, Zbg, shading="nearest")
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        ax.set_aspect("equal", adjustable="box")
+        ax.scatter(meet_pts[:, 0], meet_pts[:, 1], s=10, c="red", marker=".", label="Meeting Area")
+        ax.scatter([meet_xy[0]], [meet_xy[1]], s=80, marker="s", c="pink", edgecolors="k", label="Meeting Location")
+
+    # panels a/b/c for drones 1,2,3 (ids 0,1,2)
+    for j, rid in enumerate([0, 1, 2]):
+        ax = axes[j]
+        _panel_bg(ax)
+        ax.set_title(panel_titles[j])
+
+        ax.scatter([A[rid, 0]], [A[rid, 1]], s=60, c="white", edgecolors="k", label="Start")
+        ax.scatter([B[rid, 0]], [B[rid, 1]], s=60, c="lime", edgecolors="k", marker="x", label="Goal")
+
+        P = np.array(paths_xy[rid], dtype=float)
+        if split_idx is not None:
+            P = P[: split_idx + 1]
+        P = compress_path(P, keep_every=10)
+        ax.plot(P[:, 0], P[:, 1], lw=3.0, color="black", label=f"robot{rid+1}")
+        ax.scatter(P[:, 0], P[:, 1], s=18, marker="s", c="pink", alpha=0.9)
+
+        ax.legend(loc="lower right", fontsize=7, framealpha=0.9)
+
+    # panel d: post-meeting segments for all drones
+    ax = axes[3]
+    _panel_bg(ax)
+    ax.set_title(panel_titles[3])
+    colors = ["black", "green", "blue", "orange"]
+    for i in range(NUM):
+        P = np.array(paths_xy[i], dtype=float)
+        if split_idx is not None and split_idx < len(P) - 1:
+            P = P[split_idx:]
+        P = compress_path(P, keep_every=14)
+        ax.plot(P[:, 0], P[:, 1], lw=3.0, color=colors[i % len(colors)], label=f"robot{i+1}")
+    ax.legend(loc="lower right", fontsize=7, framealpha=0.9)
+
+    plt.tight_layout()
+    plt.savefig(OUTDIR / "planning_paths_4panel.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    print("\nSaved plots:")
+    print(f" - {OUTDIR / 'wmsr_distance.png'}")
+    print(f" - {OUTDIR / 'wmsr_x.png'}")
+    print(f" - {OUTDIR / 'wmsr_xy.png'}")
+    print(f" - {OUTDIR / 'planning_paths_4panel.png'}")
 
 
 if __name__ == "__main__":
