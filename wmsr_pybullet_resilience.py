@@ -1,13 +1,16 @@
-# wmsr_pybullet_resilience_paper_fixed_meetarea_v4.py
+# wmsr_paper_v4_meetpoints_given.py
 # 4 drones + 1 faulty, exactly 2 cycles:
-#   Start -> Explore -> Meet (fixed meeting area) -> Share hypers (WMSR/Mean)
-#        -> Explore -> Meet (same area) -> Share hypers -> STOP
+#   Start -> Explore -> Meet(1) -> Share hypers (WMSR/Mean)
+#        -> Explore -> Meet(2) -> Share hypers -> STOP
 #
-# Fixes:
-#   ✅ Fixed “meeting area” (paper-like red dotted square)
-#   ✅ Resilient vs non-resilient GP surfaces are now meaningfully different:
-#       - Resilient: train on GOOD drones only + WMSR hypers
-#       - Non-resilient: train on ALL drones (including faulty) + MEAN hypers
+# This version (your requested patches merged):
+#   ✅ Explore target step size = 0.03
+#   ✅ Meet target step size    = 0.02
+#   ✅ Damping-heavy PID gains (I=0)
+#   ✅ [DEBUG] samples print before meeting hyperparameter aggregation
+#
+# Run:
+#   (.venv) python wmsr_paper_v4_meetpoints_given.py
 
 import time
 from pathlib import Path
@@ -87,7 +90,7 @@ def wmsr(vals, F: int):
         return 0.0
     if 2 * F >= n:
         return float(np.mean(vals))
-    return float(np.mean(vals[F : n - F]))
+    return float(np.mean(vals[F: n - F]))
 
 
 def aggregate_hypers(hypers_list, mode="wmsr", F=1):
@@ -124,6 +127,7 @@ def step_toward(cur_xy: np.ndarray, goal_xy: np.ndarray, step: float) -> np.ndar
 
 
 def meeting_formation(center_xyz: np.ndarray, num: int) -> np.ndarray:
+    # 4-drone "square" formation around meeting center
     s = 0.28
     offsets = np.array(
         [
@@ -181,7 +185,7 @@ def plot_paper_style_paths_4panel(
     cycle_hist: list,
     XMIN, XMAX, YMIN, YMAX,
     drones_data,
-    meeting_center_paper=(0.0, 0.0),
+    meeting_centers_paper,
     meeting_square_r=1.3,
 ):
     T, NUM, _ = pos_hist.shape
@@ -209,9 +213,6 @@ def plot_paper_style_paths_4panel(
     if not np.any(mask_c1_explore):
         mask_c1_explore = (phase_ds == "explore")
 
-    cx, cy = meeting_center_paper
-    x0, x1, y0, y1 = cx - meeting_square_r, cx + meeting_square_r, cy - meeting_square_r, cy + meeting_square_r
-
     def draw_common(ax):
         ax.pcolormesh(XX, YY, Z, shading="auto")
         ax.grid(True, linewidth=0.45, alpha=0.65)
@@ -223,13 +224,16 @@ def plot_paper_style_paths_4panel(
         ax.xaxis.set_major_locator(mticker.MaxNLocator(7))
         ax.yaxis.set_major_locator(mticker.MaxNLocator(5))
 
-        # fixed meeting area square (paper-style)
-        ax.plot([x0, x1], [y0, y0], "r--", lw=1.2)
-        ax.plot([x0, x1], [y1, y1], "r--", lw=1.2)
-        ax.plot([x0, x0], [y0, y1], "r--", lw=1.2)
-        ax.plot([x1, x1], [y0, y1], "r--", lw=1.2)
+        # Draw ALL meeting squares (one per cycle)
+        for (cx, cy) in meeting_centers_paper:
+            x0, x1 = cx - meeting_square_r, cx + meeting_square_r
+            y0, y1 = cy - meeting_square_r, cy + meeting_square_r
+            ax.plot([x0, x1], [y0, y0], "r--", lw=1.2)
+            ax.plot([x0, x1], [y1, y1], "r--", lw=1.2)
+            ax.plot([x0, x0], [y0, y1], "r--", lw=1.2)
+            ax.plot([x1, x1], [y0, y1], "r--", lw=1.2)
 
-    # sensing points (avoid spaghetti)
+    # sensing points (downsample to avoid spaghetti)
     sensing_pts = []
     for i in range(NUM):
         Xp = drones_data[i]["X"]
@@ -238,6 +242,7 @@ def plot_paper_style_paths_4panel(
     fig = plt.figure(figsize=(16, 4.4), dpi=240)
     axes = [fig.add_subplot(1, 4, i + 1) for i in range(4)]
 
+    # panels (a)-(c): show 3 good drones individually (paper-like layout)
     for r in range(3):
         ax = axes[r]
         ax.set_title("Planning Paths", fontsize=11)
@@ -247,6 +252,7 @@ def plot_paper_style_paths_4panel(
         if sensing_pts[r].shape[0] > 0:
             ax.scatter(sensing_pts[r][:, 0], sensing_pts[r][:, 1], s=8, c="red", alpha=0.75, marker=".")
 
+    # panel (d): replanning/all robots
     ax = axes[3]
     ax.set_title("Planning Paths", fontsize=11)
     draw_common(ax)
@@ -282,7 +288,7 @@ def plot_gp_surfaces_4panel_paper(
 
     Z_true = field_f_paper(XX, YY)
 
-    # Initial GP: use early points from all GOOD drones (less flat than using one drone)
+    # Initial GP: early points from all GOOD drones
     X_init_list, y_init_list = [], []
     for i in good_ids:
         Xi = drones_data[i]["X"]
@@ -394,13 +400,15 @@ def main():
     YMIN, YMAX = 0.2, 1.1
     Z_GOAL = 1.2
 
-    MAX_CYCLES = 2
+    MAX_CYCLES = 2  # exactly two meetings
 
     # explore
     EXPLORE_TIMEOUT_SEC = 45.0
     EXPLORE_MIN_SEC = 10.0
     WP_REACH_XY = 0.15
-    WAYPOINT_STEP_EXPLORE = 0.16
+
+    # ✅ PATCH: reduced explore step
+    WAYPOINT_STEP_EXPLORE = 0.03   # was ~0.16 (too aggressive at 240Hz)
 
     # meet
     Z_TOL = 0.25
@@ -411,7 +419,7 @@ def main():
     # takeoff
     TAKEOFF_SEC = 2.0
 
-    # two-step meet
+    # two-step meet (approach then settle)
     MEET_Z_APPROACH = 1.45
     MEET_Z_FINAL = 1.20
     MEET_APPROACH_SEC = 2.0
@@ -431,12 +439,14 @@ def main():
     def inside_box(xy):
         return (XMIN <= xy[0] <= XMAX) and (YMIN <= xy[1] <= YMAX)
 
-    # -------- FIXED MEETING AREA (paper coords) --------
-    MEET_PAPER_CENTER = (-0.8, 0.6)  # like paper (center-ish)
-    MEET_SIM_X, MEET_SIM_Y = paper_to_sim_xy(MEET_PAPER_CENTER[0], MEET_PAPER_CENTER[1], XMIN, XMAX, YMIN, YMAX)
-    MEETING_CENTER = np.array([MEET_SIM_X, MEET_SIM_Y, Z_GOAL], dtype=np.float32)
+    # -------- USER-DEFINED MEETING CENTERS (paper coords) --------
+    MEET_CENTERS_PAPER = [
+        (-0.8, 0.6),   # Meeting 1 (cycle 0)
+        (0.6,  1.2),   # Meeting 2 (cycle 1)
+    ]
+    assert len(MEET_CENTERS_PAPER) >= MAX_CYCLES
 
-    # Fault model (make mean vs WMSR differ more)
+    # Fault model
     faulty_set = {3}
     good_set = set(range(NUM)) - faulty_set
     good_ids = sorted(list(good_set))
@@ -446,19 +456,22 @@ def main():
     meas_noise_std = 0.25
     faulty_extra_noise = 0.8
     attack_bias = 8.0
-    BAD_H = (800.0, 25.0, 50.0)  # strong liar hypers to separate MEAN from WMSR
+    BAD_H = (800.0, 25.0, 50.0)  # liar hypers
 
     # start positions
     A0 = np.array([0.0, 0.0, 1.0], dtype=np.float32)
     eps = 0.25
-    offsets = np.array([[0.0, 0.0, 0.0], [eps, 0.0, 0.0], [0.0, eps, 0.0], [eps, eps, 0.0]], dtype=np.float32)
+    offsets = np.array(
+        [[0.0, 0.0, 0.0], [eps, 0.0, 0.0], [0.0, eps, 0.0], [eps, eps, 0.0]],
+        dtype=np.float32,
+    )
     A = A0.reshape(1, 3) + offsets
     TARGET_RPY = np.zeros((NUM, 3), dtype=np.float32)
 
     SUBAREAS = subareas_for_drones(XMIN, XMAX, YMIN, YMAX)
 
     def build_explore_wps_for_cycle(cyc: int):
-        # shift sweeps slightly after meeting (paper-ish "replan")
+        # slight shift after meeting (replan look)
         dx = 0.06 * np.cos(0.9 * cyc)
         dy = 0.06 * np.sin(0.7 * cyc)
         wps = []
@@ -473,8 +486,17 @@ def main():
             wps.append(make_sweep_waypoints(lo_x, hi_x, lo_y, hi_y, rows=6, z=Z_GOAL))
         return wps
 
-    print("\n=== PAPER-LIKE RUN (v4) — fixed meeting area + surface difference ===")
-    print("Meeting center (paper):", MEET_PAPER_CENTER, "-> (sim):", MEETING_CENTER.tolist())
+    # initial meeting center (cycle 0)
+    cycle = 0
+    MEET_PAPER_CENTER = MEET_CENTERS_PAPER[cycle]
+    MEET_SIM_X, MEET_SIM_Y = paper_to_sim_xy(
+        MEET_PAPER_CENTER[0], MEET_PAPER_CENTER[1], XMIN, XMAX, YMIN, YMAX
+    )
+    MEETING_CENTER = np.array([MEET_SIM_X, MEET_SIM_Y, Z_GOAL], dtype=np.float32)
+
+    print("\n=== PAPER-LIKE RUN (v4 + user meeting points) ===")
+    print("Meeting centers (paper):", MEET_CENTERS_PAPER)
+    print("Meeting center #1 (paper)->(sim):", MEET_PAPER_CENTER, "->", MEETING_CENTER.tolist())
     print("Faulty:", faulty_ids, "| WMSR F=", F, "| BAD_H=", BAD_H, "\n")
 
     env = CtrlAviary(
@@ -489,7 +511,16 @@ def main():
     )
     env.reset()
 
+    # Controllers
     ctrls = [DSLPIDControl(drone_model=DRONE_MODEL) for _ in range(NUM)]
+
+    # ================= PID TUNING (PATCH) =================
+    for c in ctrls:
+        c.PID_POS_XY  = np.array([0.6, 0.0, 0.55], dtype=float)
+        c.PID_POS_Z   = np.array([1.2, 0.0, 0.45], dtype=float)
+        c.PID_ATT_RPY = np.array([3.0, 0.0, 0.18], dtype=float)
+    print("[PID CHECK]", ctrls[0].PID_POS_XY, ctrls[0].PID_POS_Z, ctrls[0].PID_ATT_RPY)
+    # ======================================================
 
     # store training data in paper coords
     drones = [{"id": i, "X": np.empty((0, 2), dtype=float), "y": np.empty((0,), dtype=float)} for i in range(NUM)]
@@ -497,11 +528,18 @@ def main():
     # GUI labels
     for i in range(NUM):
         color = [1, 0, 0] if i in faulty_set else [0, 0.7, 1]
-        p.addUserDebugText(f"R{i}", [float(A[i, 0]), float(A[i, 1]), float(A[i, 2])],
-                           textColorRGB=color, textSize=1.0, lifeTime=0)
+        p.addUserDebugText(
+            f"R{i}",
+            [float(A[i, 0]), float(A[i, 1]), float(A[i, 2])],
+            textColorRGB=color,
+            textSize=1.0,
+            lifeTime=0,
+        )
 
-    meeting_text_id = p.addUserDebugText("MEETING", MEETING_CENTER.tolist(),
-                                         textColorRGB=[1, 0, 1], textSize=1.2, lifeTime=0)
+    meeting_text_id = p.addUserDebugText(
+        "MEETING", MEETING_CENTER.tolist(),
+        textColorRGB=[1, 0, 1], textSize=1.2, lifeTime=0
+    )
 
     # logs
     pos_hist, phase_hist, cycle_hist = [], [], []
@@ -526,19 +564,23 @@ def main():
 
         for i in range(NUM):
             state = np.array(get_state_vector(env, i), dtype=np.float32)
-            pos = state[0:3]; quat = state[3:7]
+            pos = state[0:3]
+            quat = state[3:7]
             vel = state[10:13] if state.shape[0] >= 13 else np.zeros(3, dtype=np.float32)
             ang_vel = state[13:16] if state.shape[0] >= 16 else np.zeros(3, dtype=np.float32)
             cur_pos[i, :] = pos
 
             out = ctrls[i].computeControl(
-                control_timestep=DT, cur_pos=pos, cur_quat=quat, cur_vel=vel, cur_ang_vel=ang_vel,
-                target_pos=hover_targets[i], target_rpy=TARGET_RPY[i],
+                control_timestep=DT,
+                cur_pos=pos, cur_quat=quat, cur_vel=vel, cur_ang_vel=ang_vel,
+                target_pos=hover_targets[i],
+                target_rpy=TARGET_RPY[i],
             )
             rpm = out[0] if isinstance(out, (tuple, list)) else out
             rpms[i, :] = np.array(rpm, dtype=np.float32).reshape(4,)
 
         env.step(rpms)
+
         if GUI and (k % 8 == 0):
             cam_target = cur_pos[FOLLOW_ID]
             p.resetDebugVisualizerCamera(
@@ -549,7 +591,6 @@ def main():
             time.sleep(DT)
 
     # MAIN LOOP
-    cycle = 0
     phase = "explore"
     phase_start_t = 0.0
 
@@ -622,6 +663,7 @@ def main():
                     stuck_time[i] = 0.0
                     tgt = wps[min(int(wp_idx[i]), len(wps) - 1)]
 
+                # ✅ PATCH: reduced explore step already via WAYPOINT_STEP_EXPLORE
                 wp_xy = step_toward(xy, tgt[:2], WAYPOINT_STEP_EXPLORE)
                 wp_xy = clamp_xy(wp_xy)
 
@@ -649,7 +691,9 @@ def main():
                     continue
 
                 tgt = meet_targets[i]
-                wp_xy = step_toward(xy, tgt[:2], 0.10)
+
+                # ✅ PATCH: reduced meet step to 0.02
+                wp_xy = step_toward(xy, tgt[:2], 0.02)
                 wp_xy = clamp_xy(wp_xy)
 
                 active_target[i, 0] = float(wp_xy[0])
@@ -659,13 +703,16 @@ def main():
         # control + measurement
         for i in range(NUM):
             state = np.array(get_state_vector(env, i), dtype=np.float32)
-            pos = state[0:3]; quat = state[3:7]
+            pos = state[0:3]
+            quat = state[3:7]
             vel = state[10:13] if state.shape[0] >= 13 else np.zeros(3, dtype=np.float32)
             ang_vel = state[13:16] if state.shape[0] >= 16 else np.zeros(3, dtype=np.float32)
 
             out = ctrls[i].computeControl(
-                control_timestep=DT, cur_pos=pos, cur_quat=quat, cur_vel=vel, cur_ang_vel=ang_vel,
-                target_pos=active_target[i], target_rpy=np.zeros(3, dtype=np.float32),
+                control_timestep=DT,
+                cur_pos=pos, cur_quat=quat, cur_vel=vel, cur_ang_vel=ang_vel,
+                target_pos=active_target[i],
+                target_rpy=np.zeros(3, dtype=np.float32),
             )
             rpm = out[0] if isinstance(out, (tuple, list)) else out
             rpms[i, :] = np.array(rpm, dtype=np.float32).reshape(4,)
@@ -673,7 +720,7 @@ def main():
             x, y = float(pos[0]), float(pos[1])
             xp, yp = to_paper_xy(x, y, XMIN, XMAX, YMIN, YMAX)
             true_val = float(field_f_paper(xp, yp))
-            noise = float(np.random.normal(0.0, 0.25))
+            noise = float(np.random.normal(0.0, meas_noise_std))
 
             if i in faulty_set:
                 attack = attack_bias * np.sin(0.4 * xp) * np.cos(0.6 * yp)
@@ -737,9 +784,13 @@ def main():
             if done or timed_out:
                 print(f"\n[MEET COMPLETE] -> share hypers (WMSR vs MEAN)")
 
+                # ✅ PATCH: debug sample counts
+                print("[DEBUG] samples per drone:", [drones[i]["X"].shape[0] for i in range(NUM)])
+
                 hypers = []
                 for i in range(NUM):
-                    Xp = drones[i]["X"]; yv = drones[i]["y"]
+                    Xp = drones[i]["X"]
+                    yv = drones[i]["y"]
                     if Xp.shape[0] >= 40:
                         gp_tmp = build_gp(amp=1.0, ls=2.0, noi=0.25, optimize=OPTIMIZE_AT_MEET, seed=10 + i)
                         gp_tmp.fit(Xp, yv)
@@ -760,10 +811,27 @@ def main():
                 print("  MEAN =", tuple(round(v, 3) for v in mean_h))
                 print("  DIFF =", tuple(round(abs(wmsr_h[j] - mean_h[j]), 3) for j in range(3)))
 
+                # advance cycle
                 cycle += 1
                 if cycle >= MAX_CYCLES:
                     print("\nDone: completed 2 Explore->Meet cycles. Closing.")
                     break
+
+                # update to next user-defined meeting center
+                MEET_PAPER_CENTER = MEET_CENTERS_PAPER[cycle]
+                MEET_SIM_X, MEET_SIM_Y = paper_to_sim_xy(
+                    MEET_PAPER_CENTER[0], MEET_PAPER_CENTER[1], XMIN, XMAX, YMIN, YMAX
+                )
+                MEETING_CENTER = np.array([MEET_SIM_X, MEET_SIM_Y, Z_GOAL], dtype=np.float32)
+
+                try:
+                    p.removeUserDebugItem(meeting_text_id)
+                except Exception:
+                    pass
+                meeting_text_id = p.addUserDebugText(
+                    "MEETING", MEETING_CENTER.tolist(),
+                    textColorRGB=[1, 0, 1], textSize=1.2, lifeTime=0
+                )
 
                 print("\n[SWITCH] meet -> explore (replan sweeps)\n")
                 phase = "explore"
@@ -786,7 +854,7 @@ def main():
         cycle_hist=cycle_hist,
         XMIN=XMIN, XMAX=XMAX, YMIN=YMIN, YMAX=YMAX,
         drones_data=drones,
-        meeting_center_paper=MEET_PAPER_CENTER,
+        meeting_centers_paper=MEET_CENTERS_PAPER[:MAX_CYCLES],
         meeting_square_r=1.3,
     )
 
